@@ -68,7 +68,7 @@ async def validate_sandbox_source(
     if not parsed:
         return ValidatorResult(
             valid=False,
-            message=f"Unsupported git forge. Only GitHub, GitLab, and Bitbucket URLs are supported for validation.",
+            message="Unsupported git forge. Only GitHub, GitLab, and Bitbucket URLs are supported for validation.",
         )
 
     forge, owner, repo = parsed

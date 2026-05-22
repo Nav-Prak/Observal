@@ -194,7 +194,7 @@ def _generate_plugin_instructions(hook_listing, ide_info: dict, ide_event: str) 
         "config_snippet": {
             "_manual_setup": True,
             "_instructions": [
-                f"OpenCode uses a plugin system for hooks.",
+                "OpenCode uses a plugin system for hooks.",
                 f"Create a plugin file in .opencode/plugins/{hook_listing.name}.ts",
                 f"Register the '{ide_event}' event handler.",
                 f"Command to execute: {command}",

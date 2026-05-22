@@ -495,10 +495,7 @@ def _materialize_hook_components(manifest: AgentManifest, ide: str) -> tuple[lis
     # Build the merged config snippet
     hook_configs: list[HookConfigEntry] = []
     if all_hook_entries and config_path:
-        if ide == "cursor":
-            snippet = {"version": 1, "hooks": all_hook_entries}
-        else:
-            snippet = {"hooks": all_hook_entries}
+        snippet = {"version": 1, "hooks": all_hook_entries} if ide == "cursor" else {"hooks": all_hook_entries}
         hook_configs.append(HookConfigEntry(
             config_path=config_path,
             config_snippet=snippet,

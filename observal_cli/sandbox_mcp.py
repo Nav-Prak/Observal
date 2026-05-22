@@ -66,7 +66,6 @@ def main():
     args = parser.parse_args()
 
     sandboxes = json.loads(args.sandboxes)
-    sandbox_map = {s["name"]: s for s in sandboxes}
 
     # Build tool definitions + direct tool_name -> sandbox map
     tool_to_sandbox: dict[str, dict] = {}
@@ -121,7 +120,7 @@ def main():
             sb = tool_to_sandbox.get(tool_name)
             if not sb:
                 _send_message(_make_response(req_id, {
-                    "content": [{"type": "text", "text": f"Unknown sandbox: {sb_name}"}],
+                    "content": [{"type": "text", "text": f"Unknown sandbox tool: {tool_name}"}],
                     "isError": True,
                 }))
                 continue
