@@ -72,7 +72,7 @@ async def validate_sandbox_source(
         )
 
     forge, owner, repo = parsed
-    ref = source_ref or "main"
+    ref = source_ref or "main"  # Note: defaults to 'main'; repos using 'master' must pass source_ref explicitly
 
     # Build path to Dockerfile
     if sandbox_path:

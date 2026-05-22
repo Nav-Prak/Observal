@@ -68,10 +68,12 @@ def main():
     sandboxes = json.loads(args.sandboxes)
     sandbox_map = {s["name"]: s for s in sandboxes}
 
-    # Build tool definitions
+    # Build tool definitions + direct tool_name -> sandbox map
+    tool_to_sandbox: dict[str, dict] = {}
     tools = []
     for sb in sandboxes:
         tool_name = f"run_sandbox_{sb['name'].replace('-', '_')}"
+        tool_to_sandbox[tool_name] = sb
         tools.append({
             "name": tool_name,
             "description": (
@@ -115,9 +117,8 @@ def main():
             tool_name = params.get("name", "")
             arguments = params.get("arguments", {})
 
-            # Extract sandbox name from tool name
-            sb_name = tool_name.replace("run_sandbox_", "").replace("_", "-")
-            sb = sandbox_map.get(sb_name)
+            # Direct lookup from tool name to sandbox spec
+            sb = tool_to_sandbox.get(tool_name)
             if not sb:
                 _send_message(_make_response(req_id, {
                     "content": [{"type": "text", "text": f"Unknown sandbox: {sb_name}"}],

@@ -503,14 +503,15 @@ def _build_hook_configs(
     return hooks
 
 
-_HOOK_EVENTS_MAP: dict[str, dict[str, str]] = {
-    "cursor": {"PreToolUse": "preToolUse", "PostToolUse": "postToolUse", "Stop": "sessionEnd", "SessionStart": "sessionStart", "UserPromptSubmit": "beforeSubmitPrompt"},
-    "vscode": {"PreToolUse": "PreToolUse", "PostToolUse": "PostToolUse", "Stop": "SessionEnd", "SessionStart": "SessionStart"},
-    "gemini-cli": {"PreToolUse": "BeforeTool", "PostToolUse": "AfterTool", "Stop": "SessionEnd", "SessionStart": "SessionStart", "UserPromptSubmit": "BeforeAgent"},
-    "codex": {"PreToolUse": "pre_tool_use", "PostToolUse": "post_tool_use", "Stop": "session_stop", "UserPromptSubmit": "user_prompt_submit"},
-    "copilot": {"PreToolUse": "preToolUse", "PostToolUse": "postToolUse", "Stop": "sessionEnd", "SessionStart": "sessionStart"},
-    "copilot-cli": {"PreToolUse": "preToolUse", "PostToolUse": "postToolUse", "Stop": "sessionEnd", "SessionStart": "sessionStart"},
-}
+def _get_hook_events_map(ide: str) -> dict[str, str]:
+    """Get canonical event → IDE event mapping from the IDE registry."""
+    return IDE_REGISTRY.get(ide, {}).get("hook_events_map", {})
+
+
+def _get_hook_scripts_dir(ide: str) -> str:
+    """Get the hook scripts directory for an IDE from the registry."""
+    return IDE_REGISTRY.get(ide, {}).get("hook_scripts_dir", "")
+
 
 _HOOK_SCRIPTS_DIR: dict[str, str] = {
     "cursor": ".cursor/hooks",
@@ -526,7 +527,7 @@ _HOOK_SCRIPTS_DIR: dict[str, str] = {
 
 def _merge_hook_components_into_config(hooks_content: dict, hook_configs: list[dict], ide: str) -> None:
     """Merge user-submitted hook components into the IDE hooks config dict (in-place)."""
-    events_map = _HOOK_EVENTS_MAP.get(ide, {})
+    events_map = _get_hook_events_map(ide)
     scripts_dir = _HOOK_SCRIPTS_DIR.get(ide, "")
     hooks_dict = hooks_content.setdefault("hooks", {})
 

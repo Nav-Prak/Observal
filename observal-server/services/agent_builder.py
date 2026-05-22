@@ -460,8 +460,8 @@ def _materialize_hook_components(manifest: AgentManifest, ide: str) -> tuple[lis
         handler_type = hook.handler_type or "command"
         command = hook.handler_config.get("command", "")
         timeout = hook.handler_config.get("timeout")
-        script_filename = getattr(hook, "script_filename", None) or hook.config_override.get("script_filename") if hook.config_override else None
-        script_content = getattr(hook, "script_content", None) or hook.config_override.get("script_content") if hook.config_override else None
+        script_filename = getattr(hook, "script_filename", None) or (getattr(hook, "config_override", None) or {}).get("script_filename")
+        script_content = getattr(hook, "script_content", None) or (getattr(hook, "config_override", None) or {}).get("script_content")
 
         # If hook has a script, write it and rewrite the command
         actual_command = command
