@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import jwt as pyjwt
 from authlib.integrations.starlette_client import OAuth
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from loguru import logger as optic
 from redis.exceptions import RedisError
@@ -56,6 +56,13 @@ from services.username_generator import generate_unique_username
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
+REFRESH_COOKIE_NAME = "observal_refresh_token"
+REFRESH_COOKIE_PATH = "/api/v1/auth"
+AUTH_FAIL_LIMIT = 10
+AUTH_LOCKOUT_SECONDS = 15 * 60
+AUTH_FAIL_WINDOW_SECONDS = 15 * 60
+USER_SESSION_REVOCATION_SECONDS = 30 * 86400
+
 _COMMON_WEAK_PASSWORDS = frozenset(
     {
         # Passwords that fail the complexity rules anyway (kept for clarity)
@@ -80,6 +87,100 @@ _COMMON_WEAK_PASSWORDS = frozenset(
         "P@$$w0rd1234",
     }
 )
+
+
+def _refresh_ttl_seconds() -> int:
+    return ds.get_sync_int("jwt.refresh_token_expire_days", 7) * 86400
+
+
+def _refresh_cookie_secure(request: Request) -> bool:
+    frontend_url = ds.get_sync("deployment.frontend_url", "")
+    return request.url.scheme == "https" or frontend_url.startswith("https://")
+
+
+def _set_refresh_cookie(response: Response, request: Request, refresh_token: str) -> None:
+    response.set_cookie(
+        REFRESH_COOKIE_NAME,
+        refresh_token,
+        max_age=_refresh_ttl_seconds(),
+        httponly=True,
+        secure=_refresh_cookie_secure(request),
+        samesite="lax",
+        path=REFRESH_COOKIE_PATH,
+    )
+
+
+def _clear_refresh_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        REFRESH_COOKIE_NAME,
+        httponly=True,
+        secure=_refresh_cookie_secure(request),
+        samesite="lax",
+        path=REFRESH_COOKIE_PATH,
+    )
+
+
+def _account_fail_key(user_id) -> str:
+    return f"auth:fail:{user_id}"
+
+
+def _account_lock_key(user_id) -> str:
+    return f"auth:lock:{user_id}"
+
+
+def _refresh_user_key(user_id) -> str:
+    return f"refresh_user:{user_id}"
+
+
+async def _track_refresh_jti(redis, user_id, jti: str, ttl: int) -> None:
+    user_key = _refresh_user_key(user_id)
+    if hasattr(redis, "sadd"):
+        await redis.sadd(user_key, jti)
+        if hasattr(redis, "expire"):
+            await redis.expire(user_key, ttl)
+
+
+async def _clear_auth_failures(redis, user_id) -> None:
+    await redis.delete(_account_fail_key(user_id), _account_lock_key(user_id))
+
+
+async def _raise_if_account_locked(redis, user: User) -> None:
+    if await redis.get(_account_lock_key(user.id)):
+        raise HTTPException(status_code=429, detail="Account is temporarily locked due to failed login attempts")
+
+
+async def _record_failed_login(redis, user: User) -> int:
+    fail_key = _account_fail_key(user.id)
+    if hasattr(redis, "incr"):
+        count = await redis.incr(fail_key)
+    else:
+        current = await redis.get(fail_key)
+        count = int(current or 0) + 1
+        await redis.setex(fail_key, AUTH_FAIL_WINDOW_SECONDS, str(count))
+    if hasattr(redis, "expire"):
+        await redis.expire(fail_key, AUTH_FAIL_WINDOW_SECONDS)
+    if count >= AUTH_FAIL_LIMIT:
+        await redis.setex(_account_lock_key(user.id), AUTH_LOCKOUT_SECONDS, "1")
+    return count
+
+
+async def _revoke_user_sessions(redis, user_id, ttl: int = USER_SESSION_REVOCATION_SECONDS) -> None:
+    await redis.setex(f"revoked_user:{user_id}", ttl, "1")
+    user_key = _refresh_user_key(user_id)
+    if hasattr(redis, "smembers"):
+        jtis = await redis.smembers(user_key)
+        if jtis:
+            keys = [f"refresh_jti:{jti.decode() if isinstance(jti, bytes) else jti}" for jti in jtis if jti]
+            if keys:
+                await redis.delete(*keys)
+    await redis.delete(user_key)
+
+
+def _refresh_token_from_request(
+    request: Request, req: RefreshRequest | RevokeRequest | LogoutRequest | None
+) -> str | None:
+    body_token = req.refresh_token if req else None
+    return body_token or request.cookies.get(REFRESH_COOKIE_NAME)
 
 
 def _validate_password_strength(password: str) -> None:
@@ -122,8 +223,9 @@ async def _issue_tokens(user: User, groups: list[str] | None = None) -> tuple[st
 
     try:
         redis = get_redis()
-        refresh_ttl = ds.get_sync_int("jwt.refresh_token_expire_days", 7) * 86400
+        refresh_ttl = _refresh_ttl_seconds()
         await redis.setex(f"refresh_jti:{jti}", refresh_ttl, str(user.id))
+        await _track_refresh_jti(redis, user.id, jti, refresh_ttl)
         # Clear any logout revocation so hooks resume after re-login
         await redis.delete(f"revoked_user:{user.id}")
     except RedisError as e:
@@ -134,7 +236,7 @@ async def _issue_tokens(user: User, groups: list[str] | None = None) -> tuple[st
 
 
 @router.post("/init", response_model=InitResponse, dependencies=[Depends(require_password_auth)])
-async def init_admin(req: InitRequest, db: AsyncSession = Depends(get_db)):
+async def init_admin(request: Request, response: Response, req: InitRequest, db: AsyncSession = Depends(get_db)):
     optic.trace("email={}", req.email)
     count = await db.scalar(select(func.count()).select_from(User))
     if count and count > 0:
@@ -161,6 +263,7 @@ async def init_admin(req: InitRequest, db: AsyncSession = Depends(get_db)):
     await db.refresh(user)
 
     access_token, refresh_token, expires_in = await _issue_tokens(user)
+    _set_refresh_cookie(response, request, refresh_token)
     return InitResponse(
         user=UserResponse.model_validate(user),
         access_token=access_token,
@@ -171,7 +274,7 @@ async def init_admin(req: InitRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/bootstrap", response_model=InitResponse, dependencies=[Depends(require_local_mode)])
 @limiter.limit("1/minute")
-async def bootstrap(request: Request, db: AsyncSession = Depends(get_db)):
+async def bootstrap(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """Auto-create admin account on a fresh server. No input needed."""
     optic.debug("bootstrap called")
     client_host = request.client.host if request.client else None
@@ -199,6 +302,7 @@ async def bootstrap(request: Request, db: AsyncSession = Depends(get_db)):
     await db.refresh(user)
 
     access_token, refresh_token, expires_in = await _issue_tokens(user)
+    _set_refresh_cookie(response, request, refresh_token)
     return InitResponse(
         user=UserResponse.model_validate(user),
         access_token=access_token,
@@ -209,7 +313,7 @@ async def bootstrap(request: Request, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=InitResponse, dependencies=[Depends(require_password_auth)])
 @limiter.limit("5/minute")
-async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(request: Request, response: Response, req: LoginRequest, db: AsyncSession = Depends(get_db)):
     """Login with email/username + password. Returns user info and JWT tokens."""
     optic.debug("auth login attempt")
     source_ip, user_agent = _extract_request_info(request)
@@ -220,13 +324,43 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
         stmt = select(User).where(or_(User.username == identifier, User.email == identifier))
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
+    redis = None
+    if user:
+        try:
+            redis = get_redis()
+            await _raise_if_account_locked(redis, user)
+        except RedisError as e:
+            optic.warning("Redis unavailable during account lockout check: {}", e)
+            raise HTTPException(status_code=503, detail="Auth service temporarily unavailable")
     if not user or not user.verify_password(req.password):
+        if user and redis:
+            try:
+                failures = await _record_failed_login(redis, user)
+                if failures >= AUTH_FAIL_LIMIT:
+                    await emit_security_event(
+                        SecurityEvent(
+                            event_type=EventType.ACCOUNT_LOCKED,
+                            severity=Severity.CRITICAL,
+                            outcome="failure",
+                            actor_id=str(user.id),
+                            actor_email=user.email,
+                            actor_role=user.role.value,
+                            source_ip=source_ip,
+                            user_agent=user_agent,
+                            detail="Account locked after repeated failed login attempts",
+                        )
+                    )
+            except RedisError as e:
+                optic.warning("Redis unavailable during account lockout update: {}", e)
+                raise HTTPException(status_code=503, detail="Auth service temporarily unavailable")
         await emit_security_event(
             SecurityEvent(
                 event_type=EventType.LOGIN_FAILURE,
                 severity=Severity.WARNING,
                 outcome="failure",
+                actor_id=str(user.id) if user else "",
                 actor_email=identifier,
+                actor_role=user.role.value if user else "",
                 source_ip=source_ip,
                 user_agent=user_agent,
                 detail="Invalid credentials",
@@ -234,7 +368,10 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
         )
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    if redis:
+        await _clear_auth_failures(redis, user.id)
     access_token, refresh_token, expires_in = await _issue_tokens(user)
+    _set_refresh_cookie(response, request, refresh_token)
     await emit_security_event(
         SecurityEvent(
             event_type=EventType.LOGIN_SUCCESS,
@@ -409,7 +546,9 @@ async def oauth_callback(request: Request, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/exchange", response_model=InitResponse)
-async def exchange_code(req: CodeExchangeRequest, db: AsyncSession = Depends(get_db)):
+async def exchange_code(
+    request: Request, response: Response, req: CodeExchangeRequest, db: AsyncSession = Depends(get_db)
+):
     """Exchange a one-time OAuth auth code for JWT credentials.
 
     The code is stored in Redis with a 30-second TTL and is deleted after
@@ -445,6 +584,8 @@ async def exchange_code(req: CodeExchangeRequest, db: AsyncSession = Depends(get
 
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired code")
+    if refresh_token:
+        _set_refresh_cookie(response, request, refresh_token)
     return InitResponse(
         user=UserResponse.model_validate(user),
         access_token=access_token,
@@ -462,7 +603,8 @@ async def whoami(current_user: User = Depends(get_current_user)):
 @router.post("/logout")
 async def logout(
     request: Request,
-    req: LogoutRequest,
+    response: Response,
+    req: LogoutRequest | None = None,
     current_user: User = Depends(get_current_user),
 ):
     """Revoke the current access token and optionally a refresh token.
@@ -490,17 +632,16 @@ async def logout(
             ttl = max(exp - now_ts, 1)
             await redis.setex(f"revoked_jti:{jti}", ttl, "1")
 
-        # Mark the user as revoked for 30 days (max hooks token lifetime)
-        hooks_ttl = 30 * 86400
-        await redis.setex(f"revoked_user:{current_user.id}", hooks_ttl, "1")
+        await _revoke_user_sessions(redis, current_user.id)
     except RedisError as e:
         optic.warning("Redis unavailable during logout: {}", e)
         raise HTTPException(status_code=503, detail="Service temporarily unavailable")
 
     # Optionally revoke the refresh token
-    if req.refresh_token:
+    refresh_token = _refresh_token_from_request(request, req)
+    if refresh_token:
         try:
-            refresh_payload = decode_refresh_token(req.refresh_token)
+            refresh_payload = decode_refresh_token(refresh_token)
             refresh_jti = refresh_payload.get("jti")
             if refresh_jti:
                 try:
@@ -509,6 +650,7 @@ async def logout(
                     pass
         except Exception:
             pass  # Best-effort
+    _clear_refresh_cookie(response, request)
 
     source_ip, user_agent = _extract_request_info(request)
     await emit_security_event(
@@ -531,7 +673,7 @@ async def logout(
 
 @router.post("/token", response_model=TokenResponse, dependencies=[Depends(require_password_auth)])
 @limiter.limit(ds.get_sync("security.rate_limit_auth", "10/minute"))
-async def issue_token(request: Request, req: TokenRequest, db: AsyncSession = Depends(get_db)):
+async def issue_token(request: Request, response: Response, req: TokenRequest, db: AsyncSession = Depends(get_db)):
     """Exchange email/username + password for JWT access + refresh tokens."""
     optic.trace("email={}", req.email)
     source_ip, user_agent = _extract_request_info(request)
@@ -542,13 +684,43 @@ async def issue_token(request: Request, req: TokenRequest, db: AsyncSession = De
         stmt = select(User).where(or_(User.username == identifier, User.email == identifier))
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
+    redis = None
+    if user:
+        try:
+            redis = get_redis()
+            await _raise_if_account_locked(redis, user)
+        except RedisError as e:
+            optic.warning("Redis unavailable during account lockout check: {}", e)
+            raise HTTPException(status_code=503, detail="Auth service temporarily unavailable")
     if not user or not user.verify_password(req.password):
+        if user and redis:
+            try:
+                failures = await _record_failed_login(redis, user)
+                if failures >= AUTH_FAIL_LIMIT:
+                    await emit_security_event(
+                        SecurityEvent(
+                            event_type=EventType.ACCOUNT_LOCKED,
+                            severity=Severity.CRITICAL,
+                            outcome="failure",
+                            actor_id=str(user.id),
+                            actor_email=user.email,
+                            actor_role=user.role.value,
+                            source_ip=source_ip,
+                            user_agent=user_agent,
+                            detail="Account locked after repeated failed token attempts",
+                        )
+                    )
+            except RedisError as e:
+                optic.warning("Redis unavailable during account lockout update: {}", e)
+                raise HTTPException(status_code=503, detail="Auth service temporarily unavailable")
         await emit_security_event(
             SecurityEvent(
                 event_type=EventType.LOGIN_FAILURE,
                 severity=Severity.WARNING,
                 outcome="failure",
+                actor_id=str(user.id) if user else "",
                 actor_email=identifier,
+                actor_role=user.role.value if user else "",
                 source_ip=source_ip,
                 user_agent=user_agent,
                 detail="Invalid credentials (token endpoint)",
@@ -556,6 +728,8 @@ async def issue_token(request: Request, req: TokenRequest, db: AsyncSession = De
         )
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    if redis:
+        await _clear_auth_failures(redis, user.id)
     await emit_security_event(
         SecurityEvent(
             event_type=EventType.LOGIN_SUCCESS,
@@ -569,6 +743,7 @@ async def issue_token(request: Request, req: TokenRequest, db: AsyncSession = De
         )
     )
     access_token, refresh_token, expires_in = await _issue_tokens(user)
+    _set_refresh_cookie(response, request, refresh_token)
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -578,11 +753,19 @@ async def issue_token(request: Request, req: TokenRequest, db: AsyncSession = De
 
 @router.post("/token/refresh", response_model=TokenResponse)
 @limiter.limit(ds.get_sync("security.rate_limit_auth", "10/minute"))
-async def refresh_token(request: Request, req: RefreshRequest, db: AsyncSession = Depends(get_db)):
+async def refresh_token(
+    request: Request,
+    response: Response,
+    req: RefreshRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Exchange a valid refresh token for a new access token (and rotated refresh token)."""
     optic.debug("auth token refresh")
+    token = _refresh_token_from_request(request, req)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
     try:
-        payload = decode_refresh_token(req.refresh_token)
+        payload = decode_refresh_token(token)
     except pyjwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail=f"Invalid refresh token: {exc}")
 
@@ -594,6 +777,8 @@ async def refresh_token(request: Request, req: RefreshRequest, db: AsyncSession 
     # Check that the JTI has not been revoked
     try:
         redis = get_redis()
+        if await redis.get(f"revoked_user:{user_id}"):
+            raise HTTPException(status_code=401, detail="Refresh token has been revoked or expired")
         stored = await redis.get(f"refresh_jti:{jti}")
     except RedisError as e:
         optic.warning("Redis unavailable during token refresh: {}", e)
@@ -620,11 +805,26 @@ async def refresh_token(request: Request, req: RefreshRequest, db: AsyncSession 
     new_refresh_token, new_jti = create_refresh_token(user.id, user.role, groups=groups)
 
     try:
-        refresh_ttl = ds.get_sync_int("jwt.refresh_token_expire_days", 7) * 86400
+        refresh_ttl = _refresh_ttl_seconds()
         await redis.setex(f"refresh_jti:{new_jti}", refresh_ttl, str(user.id))
+        await _track_refresh_jti(redis, user.id, new_jti, refresh_ttl)
     except RedisError as e:
         optic.warning("Redis unavailable when storing new refresh JTI: {}", e)
         raise HTTPException(status_code=503, detail="Auth service temporarily unavailable")
+    _set_refresh_cookie(response, request, new_refresh_token)
+    source_ip, user_agent = _extract_request_info(request)
+    await emit_security_event(
+        SecurityEvent(
+            event_type=EventType.TOKEN_REFRESH,
+            severity=Severity.INFO,
+            outcome="success",
+            actor_id=str(user.id),
+            actor_email=user.email,
+            actor_role=user.role.value,
+            source_ip=source_ip,
+            user_agent=user_agent,
+        )
+    )
     return TokenResponse(
         access_token=access_token,
         refresh_token=new_refresh_token,
@@ -634,11 +834,14 @@ async def refresh_token(request: Request, req: RefreshRequest, db: AsyncSession 
 
 @router.post("/token/revoke")
 @limiter.limit(ds.get_sync("security.rate_limit_auth", "10/minute"))
-async def revoke_token(request: Request, req: RevokeRequest):
+async def revoke_token(request: Request, response: Response, req: RevokeRequest | None = None):
     """Revoke a refresh token so it can no longer be used."""
     optic.debug("revoke_token called")
+    token = _refresh_token_from_request(request, req)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
     try:
-        payload = decode_refresh_token(req.refresh_token)
+        payload = decode_refresh_token(token)
     except pyjwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail=f"Invalid refresh token: {exc}")
 
@@ -653,6 +856,7 @@ async def revoke_token(request: Request, req: RevokeRequest):
         optic.warning("Redis unavailable during token revocation: {}", e)
         raise HTTPException(status_code=503, detail="Service temporarily unavailable")
 
+    _clear_refresh_cookie(response, request)
     return {"detail": "Token revoked"}
 
 
@@ -660,6 +864,7 @@ async def revoke_token(request: Request, req: RevokeRequest):
 @limiter.limit("5/minute")
 async def change_password(
     request: Request,
+    response: Response,
     req: ChangePasswordRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -676,8 +881,24 @@ async def change_password(
     try:
         redis = get_redis()
         await redis.delete(f"must_change_password:{current_user.id}")
+        await _revoke_user_sessions(redis, current_user.id)
     except RedisError:
         pass
+    _clear_refresh_cookie(response, request)
+    source_ip, user_agent = _extract_request_info(request)
+    await emit_security_event(
+        SecurityEvent(
+            event_type=EventType.PASSWORD_CHANGED,
+            severity=Severity.WARNING,
+            outcome="success",
+            actor_id=str(current_user.id),
+            actor_email=current_user.email,
+            actor_role=current_user.role.value,
+            source_ip=source_ip,
+            user_agent=user_agent,
+            detail="User changed password and active sessions were revoked",
+        )
+    )
     return {"message": "Password changed"}
 
 

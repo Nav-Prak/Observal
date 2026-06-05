@@ -43,6 +43,8 @@ class EventType(str, Enum):
     API_KEY_REJECTED = "auth.api_key.rejected"
     PASSWORD_RESET_REQUEST = "auth.password_reset.request"
     PASSWORD_RESET_COMPLETE = "auth.password_reset.complete"
+    PASSWORD_CHANGED = "auth.password.changed"
+    ACCOUNT_LOCKED = "auth.account.locked"
     REGISTRATION = "auth.registration"
     TOKEN_REFRESH = "auth.token.refresh"
 

@@ -249,10 +249,12 @@ async def reset_user_password(
     await db.commit()
 
     try:
+        from api.routes.auth import USER_SESSION_REVOCATION_SECONDS, _revoke_user_sessions
         from services.redis import get_redis
 
         redis = get_redis()
         await redis.setex(f"must_change_password:{user.id}", 86400, "1")
+        await _revoke_user_sessions(redis, user.id, USER_SESSION_REVOCATION_SECONDS)
     except (RedisError, Exception):
         pass
 
