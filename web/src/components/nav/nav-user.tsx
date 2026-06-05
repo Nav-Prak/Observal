@@ -94,7 +94,6 @@ export function NavUser({ user }: NavUserProps) {
           onClick={async () => {
             try {
               const token = sessionStorage.getItem("observal_access_token");
-              const refreshToken = localStorage.getItem("observal_refresh_token");
               if (token) {
                 await fetch("/api/v1/auth/logout", {
                   method: "POST",
@@ -102,9 +101,8 @@ export function NavUser({ user }: NavUserProps) {
                     Authorization: `Bearer ${token}`,
                     "Content-Type": "application/json",
                   },
-                  body: JSON.stringify({
-                    refresh_token: refreshToken || undefined,
-                  }),
+                  credentials: "include",
+                  body: JSON.stringify({}),
                 });
               }
             } catch {

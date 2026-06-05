@@ -56,7 +56,7 @@ function LoginContent() {
           if (!res.ok) throw new Error("Exchange failed");
           const data = await res.json();
           clearSession();
-          setTokens(data.access_token, data.refresh_token);
+          setTokens(data.access_token);
           setUserRole(data.user.role);
           setUserName(data.user.name);
           setUserEmail(data.user.email);
@@ -82,7 +82,7 @@ function LoginContent() {
 
       auth.exchangeCode({ code: ssoCode })
         .then((data) => {
-          setTokens(data.access_token, data.refresh_token);
+          setTokens(data.access_token);
           setUserRole(data.user.role);
           setUserName(data.user.name);
           setUserEmail(data.user.email);
@@ -117,13 +117,13 @@ function LoginContent() {
       const res = await auth.login({ email, password });
 
       if (res.must_change_password) {
-        setTokens(res.access_token, res.refresh_token);
+        setTokens(res.access_token);
         setMustChangePassword(true);
         setLoading(false);
         return;
       }
 
-      setTokens(res.access_token, res.refresh_token);
+      setTokens(res.access_token);
       setUserRole(res.user.role);
       setUserName(res.user.name);
       setUserEmail(res.user.email);

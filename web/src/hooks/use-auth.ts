@@ -7,7 +7,7 @@
 
 import { useEffect, useSyncExternalStore } from "react";
 import { useRouter, useLocation } from "@tanstack/react-router";
-import { auth, setUserRole, getUserRole, clearSession, refreshAccessToken } from "@/lib/api";
+import { auth, setUserRole, getUserRole, clearSession, refreshAccessToken, hasRefreshSession } from "@/lib/api";
 
 function subscribe(cb: () => void) {
   window.addEventListener("storage", cb);
@@ -19,10 +19,10 @@ function getAuthSnapshot() {
   const key = sessionStorage.getItem("observal_access_token");
   const role = getUserRole();
   if (key) return role || "pending";
-  // No access token in sessionStorage, but refresh token may exist (new tab scenario).
+  // No access token in sessionStorage, but an HttpOnly refresh cookie may exist
+  // for a previous browser session.
   // Mark as "refreshing" so the guard attempts a silent refresh before redirecting.
-  const hasRefresh = !!localStorage.getItem("observal_refresh_token");
-  return hasRefresh ? "refreshing" : "";
+  return hasRefreshSession() ? "refreshing" : "";
 }
 
 function getServerSnapshot() {

@@ -70,6 +70,7 @@ import type {
 const API = "/api/v1";
 
 const STORAGE_KEY_ACCESS_TOKEN = "observal_access_token";
+const STORAGE_KEY_HAS_SESSION = "observal_has_session";
 const STORAGE_KEY_REFRESH_TOKEN = "observal_refresh_token";
 const STORAGE_KEY_USER_ROLE = "observal_user_role";
 const STORAGE_KEY_USER_NAME = "observal_user_name";
@@ -77,28 +78,25 @@ const STORAGE_KEY_USER_EMAIL = "observal_user_email";
 const STORAGE_KEY_USER_USERNAME = "observal_user_username";
 const STORAGE_KEY_USER_AVATAR = "observal_user_avatar";
 
-// Access token is stored in sessionStorage (clears on tab close) to reduce
-// the XSS exposure window. Refresh token stays in localStorage so silent
-// refresh survives page reloads across tabs.
-// TODO(SEC-025): migrate to HttpOnly cookies via a Next.js API route for
-// full XSS protection.
 function getAccessToken(): string | null {
 	if (typeof window === "undefined") return null;
 	return sessionStorage.getItem(STORAGE_KEY_ACCESS_TOKEN);
 }
 
-function getRefreshToken(): string | null {
-	if (typeof window === "undefined") return null;
-	return localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN);
+export function hasRefreshSession(): boolean {
+	if (typeof window === "undefined") return false;
+	return localStorage.getItem(STORAGE_KEY_HAS_SESSION) === "1";
 }
 
-export function setTokens(accessToken: string, refreshToken: string) {
+export function setTokens(accessToken: string, _refreshToken?: string) {
 	sessionStorage.setItem(STORAGE_KEY_ACCESS_TOKEN, accessToken);
-	localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, refreshToken);
+	localStorage.setItem(STORAGE_KEY_HAS_SESSION, "1");
+	localStorage.removeItem(STORAGE_KEY_REFRESH_TOKEN);
 }
 
 export function clearSession() {
 	sessionStorage.removeItem(STORAGE_KEY_ACCESS_TOKEN);
+	localStorage.removeItem(STORAGE_KEY_HAS_SESSION);
 	localStorage.removeItem(STORAGE_KEY_REFRESH_TOKEN);
 	localStorage.removeItem("observal_api_key"); // clean up legacy
 	localStorage.removeItem(STORAGE_KEY_USER_ROLE);
@@ -161,20 +159,17 @@ export function getUserAvatar(): string | null {
 let _refreshPromise: Promise<boolean> | null = null;
 
 async function _tryRefreshToken(): Promise<boolean> {
-	const refreshToken = getRefreshToken();
-	if (!refreshToken) return false;
-
 	try {
 		const res = await fetch(`${API}/auth/token/refresh`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ refresh_token: refreshToken }),
+			credentials: "include",
 		});
 
 		if (!res.ok) return false;
 
 		const data = await res.json();
-		setTokens(data.access_token, data.refresh_token);
+		setTokens(data.access_token);
 		return true;
 	} catch {
 		return false;
@@ -207,6 +202,7 @@ async function request<T = unknown>(
 			headers,
 			body: body !== undefined ? JSON.stringify(body) : undefined,
 			cache: "no-store",
+			credentials: "include",
 		});
 		if (res.status < 500) break;
 		// Brief pause before retry on 5xx
@@ -234,6 +230,7 @@ async function request<T = unknown>(
 					headers,
 					body: body !== undefined ? JSON.stringify(body) : undefined,
 					cache: "no-store",
+					credentials: "include",
 				});
 				if (retryRes.ok) {
 					if (retryRes.status === 204) return undefined as T;
