@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Nav-Prak <naveenprakaasam@gmail.com>
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Tenant-scoping regression coverage for security events.
 
@@ -77,11 +77,11 @@ def test_security_events_org_id_has_existing_deployment_migration():
     deployment that created security_events before org_id was added would
     never gain the column and would fail on org-scoped insert/query.
     """
-    from services.clickhouse.schema import INIT_SQL
+    from services.clickhouse.migrations import MIGRATIONS_DIR
 
-    sql_blob = "\n".join(INIT_SQL)
-    assert "ALTER TABLE security_events ADD COLUMN IF NOT EXISTS org_id" in sql_blob
-    assert "ALTER TABLE security_events ADD INDEX IF NOT EXISTS idx_org_id" in sql_blob
+    sql = (MIGRATIONS_DIR / "004_security_events_org_scope.sql").read_text()
+    assert "ALTER TABLE security_events ADD COLUMN IF NOT EXISTS org_id" in sql
+    assert "ALTER TABLE security_events ADD INDEX IF NOT EXISTS idx_security_events_org_id" in sql
 
 
 @pytest.mark.asyncio
